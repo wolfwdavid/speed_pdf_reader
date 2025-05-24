@@ -1,13 +1,408 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vite + React</title>
-  </head>
-  <body>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web PDF Reader</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            background-color: #f3f4f6; /* Light gray background */
+            display: flex;
+            justify-content: center;
+            align-items: flex-start; /* Align to top */
+            min-height: 100vh;
+            padding: 20px;
+        }
+        #root {
+            width: 100%;
+            max-width: 960px; /* Max width for content */
+            background-color: #ffffff; /* White background for the app container */
+            border-radius: 1rem; /* Rounded corners */
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1); /* Soft shadow */
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+        /* Custom scrollbar for text preview */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #e5e7eb; /* Light gray track */
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #9ca3af; /* Darker gray thumb */
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #6b7280; /* Even darker on hover */
+        }
+    </style>
+</head>
+<body>
     <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+
+    <script type="text/babel">
+        // Set the worker source for PDF.js
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        const { useState, useEffect, useCallback, useRef } = React;
+        const RESUME_KEY_PREFIX = 'web_lastReadPage_';
+
+        function App() {
+            // State variables to manage the application's data and UI
+            const [pdfFile, setPdfFile] = useState(null); // Stores the selected PDF file object
+            const [pdfName, setPdfName] = useState('No PDF Selected'); // Displays the name of the selected PDF
+            const [extractedText, setExtractedText] = useState([]); // Array to store text content of each page
+            const [currentPageIndex, setCurrentPageIndex] = useState(0); // Current page being displayed/read
+            const [totalPages, setTotalPages] = useState(0); // Total number of pages in the PDF
+            const [isPlaying, setIsPlaying] = useState(false); // Boolean to control play/pause state of TTS
+            const [speechRate, setSpeechRate] = useState(0.8); // Speed of the speech (0.1 to 10.0)
+            const [isLoading, setIsLoading] = useState(false); // Loading indicator for PDF parsing
+
+            // Ref for the hidden file input element to programmatically trigger click
+            const fileInputRef = useRef(null);
+            // Ref for the ScrollView to enable scrolling to top when page changes
+            const textPreviewRef = useRef(null);
+
+            // --- Local Storage Functions ---
+
+            /**
+             * Loads the last read page index from local storage for a given PDF file name.
+             * @param {string} fileName - The name of the PDF file.
+             * @returns {number} The last read page index, or 0 if not found.
+             */
+            const loadResumePage = useCallback((fileName) => {
+                if (!fileName) return 0;
+                try {
+                    const key = `${RESUME_KEY_PREFIX}${fileName}`;
+                    const pageString = localStorage.getItem(key);
+                    // Parse integer, default to 0 if null or invalid
+                    return pageString != null ? parseInt(pageString, 10) : 0;
+                } catch (e) {
+                    console.error("Failed to load resume page from localStorage:", e);
+                    return 0;
+                }
+            }, []);
+
+            /**
+             * Saves the current page index to local storage for a given PDF file name.
+             * @param {string} fileName - The name of the PDF file.
+             * @param {number} page - The current page index to save.
+             */
+            const saveResumePage = useCallback((fileName, page) => {
+                if (!fileName) return;
+                try {
+                    const key = `${RESUME_KEY_PREFIX}${fileName}`;
+                    localStorage.setItem(key, page.toString());
+                } catch (e) {
+                    console.error("Failed to save resume page to localStorage:", e);
+                }
+            }, []);
+
+            // --- PDF File Handling ---
+
+            /**
+             * Handles the change event when a file is selected via the input.
+             * Validates the file type and initiates PDF parsing.
+             * @param {Event} event - The file input change event.
+             */
+            const handleFileChange = (event) => {
+                const file = event.target.files[0];
+                if (file && file.type === 'application/pdf') {
+                    setPdfFile(file);
+                    setPdfName(file.name);
+                    setIsLoading(true); // Show loading indicator
+                    // Reset states for a new PDF
+                    setExtractedText([]);
+                    setCurrentPageIndex(0);
+                    setTotalPages(0);
+                    setIsPlaying(false);
+                    window.speechSynthesis.cancel(); // Stop any ongoing speech
+
+                    parsePdf(file); // Start parsing the selected PDF
+                } else {
+                    alert('Please select a PDF file.'); // User-friendly alert for invalid file type
+                }
+            };
+
+            /**
+             * Parses the selected PDF file using PDF.js to extract text content.
+             * @param {File} file - The PDF file object.
+             */
+            const parsePdf = async (file) => {
+                try {
+                    // Read file as ArrayBuffer for PDF.js
+                    const arrayBuffer = await file.arrayBuffer();
+                    // Get PDF document from ArrayBuffer
+                    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                    setTotalPages(pdf.numPages); // Set total pages
+
+                    const pagesText = [];
+                    // Loop through each page and extract text
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const textContent = await page.getTextContent();
+                        // Join text items to form a single string for the page
+                        const pageText = textContent.items.map(item => item.str).join(' ');
+                        pagesText.push(pageText);
+                    }
+                    setExtractedText(pagesText); // Store all extracted text
+
+                    // Load resume page after text extraction is complete
+                    const resumedPage = loadResumePage(file.name);
+                    setCurrentPageIndex(resumedPage);
+                } catch (error) {
+                    console.error("Error parsing PDF:", error);
+                    alert("Failed to parse PDF. Please try again with a valid PDF.");
+                    setPdfName("Failed to load PDF"); // Update UI on error
+                } finally {
+                    setIsLoading(false); // Hide loading indicator
+                }
+            };
+
+            // --- Text-to-Speech (TTS) Control using Web Speech API ---
+
+            /**
+             * Initiates speech for the current page's text.
+             */
+            const speakCurrentPage = useCallback(() => {
+                // Check if there's text to speak and if SpeechSynthesis is available
+                if (extractedText.length === 0 || currentPageIndex >= extractedText.length || !window.speechSynthesis) {
+                    setIsPlaying(false);
+                    return;
+                }
+
+                const textToSpeak = extractedText[currentPageIndex];
+                if (!textToSpeak) {
+                    setIsPlaying(false);
+                    return;
+                }
+
+                window.speechSynthesis.cancel(); // Stop any currently speaking or queued utterances
+
+                const utterance = new SpeechSynthesisUtterance(textToSpeak);
+                utterance.rate = speechRate; // Set speech rate
+
+                // Callback when speech finishes
+                utterance.onend = () => {
+                    console.log(`Finished speaking page ${currentPageIndex + 1}`);
+                    // If not the last page, advance to the next page
+                    if (currentPageIndex < totalPages - 1) {
+                        setCurrentPageIndex(prev => prev + 1);
+                        // The `useEffect` below will automatically call speakCurrentPage for the new page
+                    } else {
+                        // All pages finished
+                        setIsPlaying(false);
+                        saveResumePage(pdfName, 0); // Reset resume progress
+                        alert('Finished reading all pages.');
+                    }
+                };
+
+                // Callback for speech errors
+                utterance.onerror = (event) => {
+                    console.error("SpeechSynthesisUtterance.onerror:", event);
+                    setIsPlaying(false);
+                    alert(`Speech error: ${event.error}. Your browser might not support speech for this text or voice.`);
+                };
+
+                window.speechSynthesis.speak(utterance); // Start speaking
+                setIsPlaying(true); // Update playing state
+            }, [extractedText, currentPageIndex, totalPages, speechRate, pdfName, saveResumePage]);
+
+            /**
+             * Toggles the play/pause state of the TTS.
+             */
+            const togglePlayPause = () => {
+                if (!pdfFile) {
+                    alert("Please select a PDF first.");
+                    return;
+                }
+                if (isPlaying) {
+                    window.speechSynthesis.pause(); // Pause speech
+                    setIsPlaying(false);
+                } else {
+                    if (window.speechSynthesis.paused) {
+                        window.speechSynthesis.resume(); // Resume speech if paused
+                    } else {
+                        // Start speaking from current page if not already speaking/paused
+                        speakCurrentPage();
+                    }
+                    setIsPlaying(true);
+                }
+            };
+
+            /**
+             * Navigates to the next page.
+             */
+            const handleNextPage = () => {
+                if (currentPageIndex < totalPages - 1) {
+                    window.speechSynthesis.cancel(); // Stop current speech
+                    setIsPlaying(false); // Pause playback
+                    setCurrentPageIndex(prev => prev + 1); // Go to next page
+                } else {
+                    alert('You are on the last page.');
+                }
+            };
+
+            /**
+             * Navigates to the previous page.
+             */
+            const handlePreviousPage = () => {
+                if (currentPageIndex > 0) {
+                    window.speechSynthesis.cancel(); // Stop current speech
+                    setIsPlaying(false); // Pause playback
+                    setCurrentPageIndex(prev => prev - 1); // Go to previous page
+                } else {
+                    alert('You are on the first page.');
+                }
+            };
+
+            // --- Effects ---
+
+            // Effect to save progress whenever the current page or PDF changes
+            useEffect(() => {
+                if (pdfName !== 'No PDF Selected' && extractedText.length > 0) {
+                    saveResumePage(pdfName, currentPageIndex);
+                }
+            }, [currentPageIndex, pdfName, extractedText.length, saveResumePage]);
+
+            // Effect to automatically speak when currentPageIndex changes (e.g., after a page finishes)
+            // or when play is toggled and a page is ready.
+            useEffect(() => {
+                if (isPlaying && extractedText.length > 0 && currentPageIndex < totalPages) {
+                    speakCurrentPage();
+                }
+                // Scroll to top of the text preview when page changes
+                if (textPreviewRef.current) {
+                    textPreviewRef.current.scrollTop = 0;
+                }
+            }, [currentPageIndex, isPlaying, extractedText, totalPages, speakCurrentPage]);
+
+            // Cleanup effect: Stop speech when the component unmounts
+            useEffect(() => {
+                return () => {
+                    if (window.speechSynthesis) {
+                        window.speechSynthesis.cancel();
+                    }
+                };
+            }, []);
+
+            return (
+                <div className="flex flex-col items-center p-6 bg-white rounded-2xl shadow-xl w-full max-w-3xl space-y-6">
+                    <h1 className="text-4xl font-extrabold text-gray-800 mb-4">Web PDF Reader</h1>
+
+                    {/* Hidden file input */}
+                    <input
+                        type="file"
+                        accept="application/pdf"
+                        onChange={handleFileChange}
+                        className="hidden"
+                        ref={fileInputRef}
+                    />
+                    {/* Custom button to trigger file input */}
+                    <button
+                        onClick={() => fileInputRef.current.click()}
+                        className="px-8 py-3 bg-blue-600 text-white font-semibold rounded-xl shadow-lg hover:bg-blue-700 transition-all duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-blue-300"
+                    >
+                        Select PDF
+                    </button>
+
+                    <p className="text-lg text-gray-600 font-medium">Selected PDF: <span className="font-bold text-gray-800">{pdfName}</span></p>
+
+                    {isLoading && (
+                        <div className="flex items-center space-x-2 text-blue-600">
+                            <svg className="animate-spin h-5 w-5 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            <span className="text-lg">Loading PDF...</span>
+                        </div>
+                    )}
+
+                    {extractedText.length > 0 && (
+                        <div className="w-full flex flex-col items-center space-y-6">
+                            <p className="text-xl font-bold text-gray-700">
+                                Page {currentPageIndex + 1} of {totalPages}
+                            </p>
+                            <div
+                                ref={textPreviewRef}
+                                className="w-full h-64 p-5 bg-gray-50 border border-gray-200 rounded-lg overflow-y-auto shadow-inner custom-scrollbar text-gray-800 text-base leading-relaxed"
+                            >
+                                <p>{extractedText[currentPageIndex]}</p>
+                            </div>
+
+                            <div className="flex justify-center items-center space-x-4 w-full">
+                                <button
+                                    onClick={handlePreviousPage}
+                                    disabled={currentPageIndex === 0 || isLoading}
+                                    className="px-6 py-2 bg-gray-500 text-white font-semibold rounded-lg shadow-md hover:bg-gray-600 transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+                                >
+                                    <span>⏪</span>
+                                    <span>Prev</span>
+                                </button>
+                                <button
+                                    onClick={togglePlayPause}
+                                    disabled={isLoading}
+                                    className="px-8 py-3 bg-green-600 text-white font-semibold rounded-xl shadow-lg hover:bg-green-700 transition-all duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-4 focus:ring-green-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {isPlaying ? '⏸️ Pause' : '▶️ Play'}
+                                </button>
+                                <button
+                                    onClick={handleNextPage}
+                                    disabled={currentPageIndex >= totalPages - 1 || isLoading}
+                                    className="px-6 py-2 bg-gray-500 text-white font-semibold rounded-lg shadow-md hover:bg-gray-600 transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+                                >
+                                    <span>Next</span>
+                                    <span>⏩</span>
+                                </button>
+                            </div>
+
+                            <div className="w-full flex flex-col items-center space-y-3 mt-4">
+                                <label htmlFor="speed" className="text-lg font-medium text-gray-700">
+                                    Speech Speed: <span className="font-bold text-blue-600">{speechRate.toFixed(1)}x</span>
+                                </label>
+                                <input
+                                    type="range"
+                                    id="speed"
+                                    min="0.5"
+                                    max="2.0"
+                                    step="0.1"
+                                    value={speechRate}
+                                    onChange={(e) => {
+                                        const newRate = parseFloat(e.target.value);
+                                        setSpeechRate(newRate);
+                                        // If currently playing, restart speech with new rate
+                                        if (isPlaying) {
+                                            window.speechSynthesis.cancel();
+                                            // A small timeout to ensure cancel completes before new speak starts
+                                            setTimeout(() => speakCurrentPage(), 50);
+                                        }
+                                    }}
+                                    className="w-3/4 h-2 bg-blue-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                                />
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Render the App component into the root div
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
 </html>
